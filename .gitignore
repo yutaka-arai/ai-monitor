@@ -1,2 +1,4 @@
 .env
 __pycache__/
+claude_usage_log.json
+monitor.py.bak

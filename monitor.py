@@ -1,3 +1,4 @@
+import json
 import math
 import os
 import re
@@ -17,11 +18,10 @@ from rich.text import Text
 
 load_dotenv()
 
-API_KEY        = os.getenv("ANTHROPIC_API_KEY")
-ADMIN_KEY      = os.getenv("ANTHROPIC_ADMIN_KEY")
-ORG_ID         = os.getenv("ORG_ID")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "claude_usage_log.json")
 
 REFRESH_INTERVAL = 60  # seconds
 BAR_WIDTH        = 20  # 横並び用コンパクトバー幅
@@ -86,29 +86,22 @@ def make_bar(label: str, used: int, base_limit: int, color: str) -> Text:
 
 # ── Claude ───────────────────────────────────────────────────────────────────
 
-def fetch_usage() -> dict | None:
-    if not ADMIN_KEY:
-        return None
-
-    now        = datetime.now(timezone.utc)
-    start_date = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-
+def load_usage_from_log() -> tuple[dict | None, str | None, str | None]:
+    """ローカルの claude_usage_log.json を読み込む。
+    戻り値: (data, log_time_str, error_msg)
+    """
+    if not os.path.exists(LOG_FILE):
+        return None, None, f"ログファイルが見つかりません: {os.path.basename(LOG_FILE)}"
     try:
-        response = requests.get(
-            "https://api.anthropic.com/v1/organizations/usage_report/messages",
-            headers={"x-api-key": ADMIN_KEY, "anthropic-version": "2023-06-01"},
-            params={
-                "starting_at": start_date.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "ending_at":   now.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "bucket_width": "1d",
-                "group_by[]":   "model",
-            },
-            timeout=10,
-        )
-        response.raise_for_status()
-        return response.json()
-    except Exception:
-        return None
+        mtime = os.path.getmtime(LOG_FILE)
+        log_time_str = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
+        with open(LOG_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data, log_time_str, None
+    except json.JSONDecodeError as e:
+        return None, None, f"JSON パースエラー: {e}"
+    except Exception as e:
+        return None, None, f"読み込みエラー: {e}"
 
 
 def aggregate_usage(data: dict) -> tuple[dict, list]:
@@ -140,7 +133,7 @@ def _session_diff(totals: dict, baseline: dict | None, key: str) -> str:
     return f"  [dim cyan]↑ セッション: +{diff:,}[/dim cyan]"
 
 
-def build_claude_panel(totals: dict, error_msg: str | None, baseline: dict | None) -> Panel:
+def build_claude_panel(totals: dict, error_msg: str | None, baseline: dict | None, log_time: str | None = None) -> Panel:
     g = Table.grid(padding=(0, 1))
     g.add_column(ratio=1)
 
@@ -169,6 +162,8 @@ def build_claude_panel(totals: dict, error_msg: str | None, baseline: dict | Non
         if session_total is not None:
             summary.append(f"  [dim cyan]↑ セッション: +{session_total:,}[/dim cyan]")
         g.add_row(summary)
+        if log_time:
+            g.add_row(Text(f"ログ更新: {log_time}", style="dim"))
 
     return Panel(g, title="[bold cyan]Claude[/bold cyan]", border_style="cyan", padding=(0, 1))
 
@@ -388,45 +383,68 @@ def main():
     global claude_baseline
     console.print("[bold cyan]Claude / OpenAI / Gemini / Copilot モニターを起動中...[/bold cyan]")
 
+    # 他サービスの結果をループ間で保持（初回サイクルで取得されるまでの暫定値）
+    openai_status: dict = {"connected": False, "error": "取得中..."}
+    gemini_models: list = []
+    gemini_error: str | None = "取得中..."
+    copilot_info: dict = {
+        "username": "", "auth_status": None, "active": False,
+        "version": None, "error": None,
+    }
+    refresh_other = True  # 初回は他サービスも必ず取得する
+
     with Live(console=console, refresh_per_second=1, screen=True) as live:
         while True:
             now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-            # データ取得
-            claude_data = fetch_usage()
+            # Claude: ログファイルを毎ループ読み込み（ローカル・高速）
+            claude_data, claude_log_time, claude_error = load_usage_from_log()
             if claude_data is not None:
                 totals, entries = aggregate_usage(claude_data)
-                claude_error = None
                 # 起動後の初回成功取得をベースラインとして保存
                 if claude_baseline is None:
                     claude_baseline = dict(totals)
             else:
                 totals, entries = {k: 0 for k in TOKEN_LIMITS}, []
-                claude_error = (
-                    "データ取得失敗 (.env を確認)" if ADMIN_KEY
-                    else "ANTHROPIC_ADMIN_KEY 未設定"
-                )
+                claude_log_time = None
 
-            openai_status  = fetch_openai_status()
-            gemini_models, gemini_error = fetch_gemini_info()
-            copilot_info = fetch_copilot_info()
+            # ログファイルの現在の mtime を記録（変更検知用）
+            try:
+                log_mtime = os.path.getmtime(LOG_FILE)
+            except OSError:
+                log_mtime = None
+
+            # 他サービスは60秒の通常サイクル完了時のみ更新
+            # （ファイル変更によるリロード時はスキップして即時表示を優先）
+            if refresh_other:
+                openai_status  = fetch_openai_status()
+                gemini_models, gemini_error = fetch_gemini_info()
+                copilot_info = fetch_copilot_info()
 
             def _make_display(countdown: int) -> Layout:
                 return build_display(
-                    build_claude_panel(totals, claude_error, claude_baseline),
+                    build_claude_panel(totals, claude_error, claude_baseline, claude_log_time),
                     build_openai_panel(openai_status, dict(openai_session_stats)),
                     build_gemini_panel(gemini_models, dict(gemini_session_stats), gemini_error),
                     build_copilot_panel(copilot_info),
                     now_str, countdown,
                 )
 
-            # 初回表示
             live.update(_make_display(REFRESH_INTERVAL))
 
-            # カウントダウン更新
+            # カウントダウン更新（ファイル変更を検知したら即座にリロード）
             for remaining in range(REFRESH_INTERVAL, 0, -1):
                 time.sleep(1)
+                try:
+                    current_mtime = os.path.getmtime(LOG_FILE)
+                except OSError:
+                    current_mtime = None
+                if current_mtime != log_mtime:
+                    refresh_other = False  # ファイル変更リロード：他サービスはスキップ
+                    break
                 live.update(_make_display(remaining))
+            else:
+                refresh_other = True  # 60秒完走：次サイクルで他サービスも更新
 
 
 if __name__ == "__main__":
