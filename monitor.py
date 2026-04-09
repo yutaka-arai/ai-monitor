@@ -23,7 +23,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "claude_usage_log.json")
 
-REFRESH_INTERVAL = 60  # seconds
+REFRESH_INTERVAL = 5  # seconds
 BAR_WIDTH        = 20  # 横並び用コンパクトバー幅
 
 # Claude: 月間トークン基準上限
@@ -172,7 +172,12 @@ def build_claude_panel(totals: dict, error_msg: str | None, baseline: dict | Non
 
 def fetch_openai_status() -> dict:
     if not OPENAI_API_KEY:
-        return {"connected": False, "error": "OPENAI_API_KEY 未設定"}
+        return {
+            "connected": False,
+            "error": "OPENAI_API_KEY 未設定",
+            "models": [],
+            "last_checked": datetime.now().strftime("%H:%M:%S"),
+        }
 
     try:
         resp = requests.get(
@@ -183,12 +188,27 @@ def fetch_openai_status() -> dict:
         resp.raise_for_status()
         models = sorted(m["id"] for m in resp.json().get("data", []))
         openai_session_stats["total_requests"] += 1
-        return {"connected": True, "error": None, "models": models}
+        return {
+            "connected": True,
+            "error": None,
+            "models": models,
+            "last_checked": datetime.now().strftime("%H:%M:%S"),
+        }
     except requests.exceptions.HTTPError as e:
         code = e.response.status_code if e.response is not None else "?"
-        return {"connected": False, "error": f"HTTP {code}", "models": []}
+        return {
+            "connected": False,
+            "error": f"HTTP {code}",
+            "models": [],
+            "last_checked": datetime.now().strftime("%H:%M:%S"),
+        }
     except requests.exceptions.RequestException as e:
-        return {"connected": False, "error": str(e), "models": []}
+        return {
+            "connected": False,
+            "error": str(e),
+            "models": [],
+            "last_checked": datetime.now().strftime("%H:%M:%S"),
+        }
 
 
 def build_openai_panel(status: dict, stats: dict) -> Panel:
@@ -199,14 +219,20 @@ def build_openai_panel(status: dict, stats: dict) -> Panel:
         g.add_row(Text(f"[red]✗ {status.get('error', '接続失敗')}[/red]"))
     else:
         g.add_row(Text("[bold green]✓ 接続済み[/bold green]"))
-        g.add_row(Text(""))
-        g.add_row(make_bar("Prompt",     stats["prompt_tokens"],     OPENAI_TOKEN_LIMIT,      "yellow"))
-        g.add_row(Text(""))
-        g.add_row(make_bar("Completion", stats["completion_tokens"],  OPENAI_TOKEN_LIMIT // 2, "cyan"))
-        g.add_row(Text(""))
-        g.add_row(make_bar("Total",      stats["total_tokens"],       OPENAI_TOKEN_LIMIT,      "white"))
-        g.add_row(Text(""))
-        g.add_row(Text(f"Req: {stats['total_requests']:,}", style="dim"))
+
+    g.add_row(Text(""))
+
+    tbl = Table(show_header=False, box=None, padding=(0, 1))
+    tbl.add_column(style="dim", no_wrap=True)
+    tbl.add_column(justify="right", style="bold white")
+    tbl.add_row("Status checks", f"{stats['total_requests']:,}")
+    tbl.add_row("Models", f"{len(status.get('models', [])):,}")
+    tbl.add_row("Last checked", status.get("last_checked", "-"))
+    g.add_row(tbl)
+
+    g.add_row(Text(""))
+    g.add_row(Text("Token usage: 未計測", style="dim"))
+    g.add_row(Text("このパネルは接続確認のみ実施", style="dim"))
 
     return Panel(g, title="[bold yellow]OpenAI[/bold yellow]", border_style="yellow", padding=(0, 1))
 
