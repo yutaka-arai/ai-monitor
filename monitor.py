@@ -4,12 +4,11 @@ import os
 import re
 import subprocess
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 
-from google import genai
 import requests
 from dotenv import load_dotenv
-from rich.console import Console, Group
+from rich.console import Console
 from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
@@ -18,12 +17,11 @@ from rich.text import Text
 
 load_dotenv()
 
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "claude_usage_log.json")
 
-REFRESH_INTERVAL = 60  # seconds
+REFRESH_INTERVAL = 5  # seconds
 BAR_WIDTH        = 20  # 横並び用コンパクトバー幅
 
 # Claude: 月間トークン基準上限
@@ -34,20 +32,10 @@ TOKEN_LIMITS = {
     "cache_read_input_tokens":     100_000,
 }
 
-# OpenAI: セッション累計基準上限
-OPENAI_TOKEN_LIMIT = 10_000
-
 # ── セッション統計 ────────────────────────────────────────────────────────────
 
 # Claude: 起動時のベースライン（差分計算用）
 claude_baseline: dict | None = None
-
-gemini_session_stats = {
-    "total_requests": 0,
-    "total_prompt_tokens": 0,
-    "total_response_tokens": 0,
-    "total_tokens": 0,
-}
 
 openai_session_stats = {
     "total_requests": 0,
@@ -79,7 +67,7 @@ def make_bar(label: str, used: int, base_limit: int, color: str) -> Text:
 
     text = Text()
     text.append(f"{label}\n", style="bold white")
-    text.append(bar)
+    text.append(Text.from_markup(bar))
     text.append(f"\n  {used:,} / {limit:,}{auto_mark}  {pct_str}", style="dim")
     return text
 
@@ -138,7 +126,7 @@ def build_claude_panel(totals: dict, error_msg: str | None, baseline: dict | Non
     g.add_column(ratio=1)
 
     if error_msg:
-        g.add_row(Text(f"[red]{error_msg}[/red]"))
+        g.add_row(Text.from_markup(f"[red]{error_msg}[/red]"))
     else:
         for label, key, limit, color in [
             ("Input",      "input_tokens",                100_000, "green"),
@@ -160,7 +148,7 @@ def build_claude_panel(totals: dict, error_msg: str | None, baseline: dict | Non
         summary = Text()
         summary.append(f"月間合計: {total_all:,} tokens", style="bold white")
         if session_total is not None:
-            summary.append(f"  [dim cyan]↑ セッション: +{session_total:,}[/dim cyan]")
+            summary.append(Text.from_markup(f"  [dim cyan]↑ セッション: +{session_total:,}[/dim cyan]"))
         g.add_row(summary)
         if log_time:
             g.add_row(Text(f"ログ更新: {log_time}", style="dim"))
@@ -171,24 +159,46 @@ def build_claude_panel(totals: dict, error_msg: str | None, baseline: dict | Non
 # ── OpenAI ───────────────────────────────────────────────────────────────────
 
 def fetch_openai_status() -> dict:
+    now_str = datetime.now().strftime("%H:%M:%S")
+
     if not OPENAI_API_KEY:
-        return {"connected": False, "error": "OPENAI_API_KEY 未設定"}
+        return {
+            "connected": False,
+            "error": "OPENAI_API_KEY 未設定",
+            "models": [],
+            "last_checked": now_str,
+        }
 
     try:
         resp = requests.get(
             "https://api.openai.com/v1/models",
             headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-            timeout=10,
+            timeout=3,
         )
         resp.raise_for_status()
         models = sorted(m["id"] for m in resp.json().get("data", []))
         openai_session_stats["total_requests"] += 1
-        return {"connected": True, "error": None, "models": models}
+        return {
+            "connected": True,
+            "error": None,
+            "models": models,
+            "last_checked": now_str,
+        }
     except requests.exceptions.HTTPError as e:
         code = e.response.status_code if e.response is not None else "?"
-        return {"connected": False, "error": f"HTTP {code}", "models": []}
+        return {
+            "connected": False,
+            "error": f"HTTP {code}",
+            "models": [],
+            "last_checked": now_str,
+        }
     except requests.exceptions.RequestException as e:
-        return {"connected": False, "error": str(e), "models": []}
+        return {
+            "connected": False,
+            "error": str(e),
+            "models": [],
+            "last_checked": now_str,
+        }
 
 
 def build_openai_panel(status: dict, stats: dict) -> Panel:
@@ -196,64 +206,95 @@ def build_openai_panel(status: dict, stats: dict) -> Panel:
     g.add_column(ratio=1)
 
     if not status["connected"]:
-        g.add_row(Text(f"[red]✗ {status.get('error', '接続失敗')}[/red]"))
+        g.add_row(Text.from_markup(f"[red]✗ {status.get('error', '接続失敗')}[/red]"))
     else:
-        g.add_row(Text("[bold green]✓ 接続済み[/bold green]"))
-        g.add_row(Text(""))
-        g.add_row(make_bar("Prompt",     stats["prompt_tokens"],     OPENAI_TOKEN_LIMIT,      "yellow"))
-        g.add_row(Text(""))
-        g.add_row(make_bar("Completion", stats["completion_tokens"],  OPENAI_TOKEN_LIMIT // 2, "cyan"))
-        g.add_row(Text(""))
-        g.add_row(make_bar("Total",      stats["total_tokens"],       OPENAI_TOKEN_LIMIT,      "white"))
-        g.add_row(Text(""))
-        g.add_row(Text(f"Req: {stats['total_requests']:,}", style="dim"))
+        g.add_row(Text.from_markup("[bold green]✓ 接続済み[/bold green]"))
+
+    g.add_row(Text(""))
+
+    tbl = Table(show_header=False, box=None, padding=(0, 1))
+    tbl.add_column(style="dim", no_wrap=True)
+    tbl.add_column(justify="right", style="bold white")
+    tbl.add_row("Status checks", f"{stats['total_requests']:,}")
+    tbl.add_row("Models", f"{len(status.get('models', [])):,}")
+    tbl.add_row("Last checked", status.get("last_checked", "-"))
+    g.add_row(tbl)
+
+    g.add_row(Text(""))
+    g.add_row(Text("Token usage: 未計測", style="dim"))
+    g.add_row(Text("このパネルは接続確認のみ実施", style="dim"))
 
     return Panel(g, title="[bold yellow]OpenAI[/bold yellow]", border_style="yellow", padding=(0, 1))
 
 
-# ── Gemini ───────────────────────────────────────────────────────────────────
+# ── Antigravity ──────────────────────────────────────────────────────────────
 
-def fetch_gemini_info() -> tuple[list, str | None]:
-    if not GOOGLE_API_KEY:
-        return [], "GOOGLE_API_KEY 未設定"
-    try:
-        client = genai.Client(api_key=GOOGLE_API_KEY)
-        models = list(client.models.list())
-        gemini_session_stats["total_requests"] += 1
-        return models, None
-    except Exception as e:
-        return [], str(e)
+_antigravity_version_cache: str | None = None
 
 
-def build_gemini_panel(models: list, stats: dict, error_msg: str | None) -> Panel:
+def fetch_antigravity_info() -> dict:
+    """agy CLI を使って Antigravity の状態とバージョンを取得する。"""
+    global _antigravity_version_cache
+
+    info = {
+        "active":  False,
+        "version": _antigravity_version_cache,
+        "status":  "準備完了",
+        "error":   None,
+    }
+
+    if _antigravity_version_cache is None:
+        try:
+            result = subprocess.run(
+                ["agy", "--version"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                _antigravity_version_cache = result.stdout.strip()
+                info["version"] = _antigravity_version_cache
+                info["active"] = True
+            else:
+                info["error"] = (result.stderr or result.stdout or "エラー").strip()
+        except Exception as e:
+            info["error"] = f"agy CLI 未検出: {e}"
+    else:
+        info["version"] = _antigravity_version_cache
+        info["active"] = True
+
+    return info
+
+
+def build_antigravity_panel(info: dict) -> Panel:
     g = Table.grid(padding=(0, 1))
     g.add_column(ratio=1)
 
-    if error_msg:
-        g.add_row(Text(f"[red]✗ {error_msg}[/red]"))
+    if info["active"]:
+        g.add_row(Text.from_markup("[bold green]✓ 稼働中 (Antigravity CLI)[/bold green]"))
     else:
-        g.add_row(Text("[bold green]✓ 接続済み[/bold green]"))
+        g.add_row(Text.from_markup(f"[bold red]✗ 未接続: {info.get('error', 'エラー')}[/bold red]"))
+
+    g.add_row(Text(""))
+
+    tbl = Table(show_header=False, box=None, padding=(0, 1))
+    tbl.add_column(style="dim", no_wrap=True)
+    tbl.add_column(style="bold white")
+    tbl.add_row("ツール名",       "Antigravity CLI (agy)")
+    tbl.add_row("バージョン",     info["version"] or "[dim]取得中...[/dim]")
+    tbl.add_row("ステータス",     info["status"] if info["active"] else "エラー")
+    tbl.add_row("プラットフォーム", "Google Antigravity 2.0")
+    g.add_row(tbl)
+
+    if info["error"]:
         g.add_row(Text(""))
+        g.add_row(Text.from_markup(f"[dim yellow]⚠ {info['error']}[/dim yellow]"))
 
-        tbl = Table(show_header=False, box=None, padding=(0, 1))
-        tbl.add_column(style="dim", no_wrap=True)
-        tbl.add_column(justify="right", style="bold white")
-        tbl.add_row("Requests",  f"{stats['total_requests']:,}")
-        tbl.add_row("Prompt tk", f"{stats['total_prompt_tokens']:,}")
-        tbl.add_row("Resp tk",   f"{stats['total_response_tokens']:,}")
-        tbl.add_row("Total tk",  f"{stats['total_tokens']:,}")
-        g.add_row(tbl)
-        g.add_row(Text(""))
+    return Panel(
+        g,
+        title="[bold cyan]Antigravity[/bold cyan]",
+        border_style="cyan",
+        padding=(0, 1),
+    )
 
-        if models:
-            g.add_row(Text(f"Models: {len(models)}", style="dim"))
-
-    return Panel(g, title="[bold green]Gemini[/bold green]", border_style="green", padding=(0, 1))
-
-
-# ── GitHub Copilot ───────────────────────────────────────────────────────────
-
-# ── GitHub Copilot ───────────────────────────────────────────────────────────
 
 # ── GitHub Copilot ───────────────────────────────────────────────────────────
 
@@ -265,7 +306,7 @@ def fetch_copilot_info() -> dict:
     global _copilot_version_cache
 
     info = {
-        "username":    "yutaka-arai",
+        "username":    "",
         "auth_status": None,
         "active":      False,
         "version":     _copilot_version_cache,
@@ -312,9 +353,9 @@ def build_copilot_panel(info: dict) -> Panel:
     g.add_column(ratio=1)
 
     if info["active"]:
-        g.add_row(Text("✓ 個人プランで稼働中", style="bold green"))
+        g.add_row(Text.from_markup("[bold green]✓ 個人プランで稼働中[/bold green]"))
     else:
-        g.add_row(Text("✗ 未認証", style="bold red"))
+        g.add_row(Text.from_markup("[bold red]✗ 未認証[/bold red]"))
 
     g.add_row(Text(""))
 
@@ -328,7 +369,7 @@ def build_copilot_panel(info: dict) -> Panel:
 
     if info["error"]:
         g.add_row(Text(""))
-        g.add_row(Text(f"⚠ {info['error']}", style="dim yellow"))
+        g.add_row(Text.from_markup(f"[dim yellow]⚠ {info['error']}[/dim yellow]"))
 
     return Panel(
         g,
@@ -338,12 +379,10 @@ def build_copilot_panel(info: dict) -> Panel:
     )
 
 
-
-
 def build_display(
     claude_panel: Panel,
     openai_panel: Panel,
-    gemini_panel: Panel,
+    antigravity_panel: Panel,
     copilot_panel: Panel,
     now_str: str,
     countdown: int,
@@ -362,8 +401,8 @@ def build_display(
 
     bot_row = Layout(name="bot_row")
     bot_row.split_row(
-        Layout(gemini_panel,  name="gemini",  minimum_size=28),
-        Layout(copilot_panel, name="copilot", minimum_size=28),
+        Layout(antigravity_panel, name="antigravity", minimum_size=28),
+        Layout(copilot_panel,     name="copilot",     minimum_size=28),
     )
 
     panels = Layout(name="panels", minimum_size=30)
@@ -381,12 +420,13 @@ def build_display(
 
 def main():
     global claude_baseline
-    console.print("[bold cyan]Claude / OpenAI / Gemini / Copilot モニターを起動中...[/bold cyan]")
+    console.print("[bold cyan]Claude / OpenAI / Antigravity / Copilot モニターを起動中...[/bold cyan]")
 
     # 他サービスの結果をループ間で保持（初回サイクルで取得されるまでの暫定値）
     openai_status: dict = {"connected": False, "error": "取得中..."}
-    gemini_models: list = []
-    gemini_error: str | None = "取得中..."
+    antigravity_info: dict = {
+        "active": False, "version": None, "status": "取得中...", "error": None
+    }
     copilot_info: dict = {
         "username": "", "auth_status": None, "active": False,
         "version": None, "error": None,
@@ -400,12 +440,12 @@ def main():
             # Claude: ログファイルを毎ループ読み込み（ローカル・高速）
             claude_data, claude_log_time, claude_error = load_usage_from_log()
             if claude_data is not None:
-                totals, entries = aggregate_usage(claude_data)
+                totals, _ = aggregate_usage(claude_data)
                 # 起動後の初回成功取得をベースラインとして保存
                 if claude_baseline is None:
                     claude_baseline = dict(totals)
             else:
-                totals, entries = {k: 0 for k in TOKEN_LIMITS}, []
+                totals = {k: 0 for k in TOKEN_LIMITS}
                 claude_log_time = None
 
             # ログファイルの現在の mtime を記録（変更検知用）
@@ -414,18 +454,18 @@ def main():
             except OSError:
                 log_mtime = None
 
-            # 他サービスは60秒の通常サイクル完了時のみ更新
+            # 他サービスは通常サイクル完了時に更新 (5秒)
             # （ファイル変更によるリロード時はスキップして即時表示を優先）
             if refresh_other:
-                openai_status  = fetch_openai_status()
-                gemini_models, gemini_error = fetch_gemini_info()
-                copilot_info = fetch_copilot_info()
+                openai_status    = fetch_openai_status()
+                antigravity_info = fetch_antigravity_info()
+                copilot_info     = fetch_copilot_info()
 
             def _make_display(countdown: int) -> Layout:
                 return build_display(
                     build_claude_panel(totals, claude_error, claude_baseline, claude_log_time),
                     build_openai_panel(openai_status, dict(openai_session_stats)),
-                    build_gemini_panel(gemini_models, dict(gemini_session_stats), gemini_error),
+                    build_antigravity_panel(antigravity_info),
                     build_copilot_panel(copilot_info),
                     now_str, countdown,
                 )
@@ -444,7 +484,7 @@ def main():
                     break
                 live.update(_make_display(remaining))
             else:
-                refresh_other = True  # 60秒完走：次サイクルで他サービスも更新
+                refresh_other = True  # 通常サイクル完走：次サイクルで他サービスも更新
 
 
 if __name__ == "__main__":

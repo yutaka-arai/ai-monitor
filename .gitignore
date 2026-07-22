@@ -3,3 +3,4 @@ __pycache__/
 claude_usage_log.json
 monitor.py.bak
 sync.log
+nohup.out

@@ -47,17 +47,18 @@ def scan_and_aggregate() -> dict:
                     if not usage:
                         continue
 
-                    # 当月フィルタ（timestamp がない行は含める）
+                    # 当月フィルタ（timestamp がない行は除外）
                     ts = entry.get("timestamp")
-                    if ts:
-                        try:
-                            entry_dt = datetime.fromisoformat(
-                                ts.replace("Z", "+00:00")
-                            )
-                            if entry_dt < month_start:
-                                continue
-                        except ValueError:
-                            pass
+                    if not ts:
+                        continue
+                    try:
+                        entry_dt = datetime.fromisoformat(
+                            ts.replace("Z", "+00:00")
+                        )
+                        if entry_dt < month_start:
+                            continue
+                    except ValueError:
+                        continue
 
                     model = msg.get("model", "unknown")
                     cc    = usage.get("cache_creation") or {}
