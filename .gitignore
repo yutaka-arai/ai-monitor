@@ -9,3 +9,7 @@ nohup.out
 claude_*.log
 claude_*.txt
 grok_*_review.md
+
+# Grok review / work logs
+grok_*.log
+grok_*.txt
