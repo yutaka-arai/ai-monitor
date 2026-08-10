@@ -441,7 +441,10 @@ def main():
         "username": "", "auth_status": None, "active": False,
         "version": None, "error": None,
     }
-    refresh_other = True  # 初回は他サービスも必ず取得する
+    # 他パネルの更新は Claude ログの mtime 監視から独立させ、経過時間だけで判定する
+    # （ログが REFRESH_INTERVAL とほぼ同周期で更新され続けると、mtime 変化検知に
+    #   位相同期してしまい他パネルがほぼ更新されなくなるため）
+    last_other_refresh = 0.0  # 初回は必ず取得する
 
     with Live(console=console, refresh_per_second=1, screen=True) as live:
         while True:
@@ -464,12 +467,13 @@ def main():
             except OSError:
                 log_mtime = None
 
-            # 他サービスは通常サイクル完了時に更新 (5秒)
-            # （ファイル変更によるリロード時はスキップして即時表示を優先）
-            if refresh_other:
+            # 他サービスは REFRESH_INTERVAL 秒以上経過していれば更新
+            now_ts = time.time()
+            if now_ts - last_other_refresh >= REFRESH_INTERVAL:
                 openai_status    = fetch_openai_status()
                 antigravity_info = fetch_antigravity_info()
                 copilot_info     = fetch_copilot_info()
+                last_other_refresh = now_ts
 
             def _make_display(countdown: int) -> Layout:
                 return build_display(
@@ -490,11 +494,8 @@ def main():
                 except OSError:
                     current_mtime = None
                 if current_mtime != log_mtime:
-                    refresh_other = False  # ファイル変更リロード：他サービスはスキップ
                     break
                 live.update(_make_display(remaining))
-            else:
-                refresh_other = True  # 通常サイクル完走：次サイクルで他サービスも更新
 
 
 if __name__ == "__main__":
