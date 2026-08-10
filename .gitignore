@@ -4,3 +4,13 @@ __pycache__/
 claude_usage_log.json
 monitor.py.bak
 sync.log
+nohup.out
+# AI review / work logs
+claude_*.log
+claude_*.txt
+grok_*_review.md
+
+# Grok review / work logs
+grok_*.log
+grok_*.txt
+sync_claude_usage.log
