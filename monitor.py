@@ -117,7 +117,7 @@ def aggregate_usage(data: dict) -> tuple[dict, list]:
 def _session_diff(totals: dict, baseline: dict | None, key: str) -> str:
     if baseline is None:
         return ""
-    diff = totals.get(key, 0) - baseline.get(key, 0)
+    diff = max(0, totals.get(key, 0) - baseline.get(key, 0))
     return f"  [dim cyan]↑ セッション: +{diff:,}[/dim cyan]"
 
 
@@ -142,7 +142,7 @@ def build_claude_panel(totals: dict, error_msg: str | None, baseline: dict | Non
 
         total_all = sum(totals.values())
         session_total = (
-            sum(totals.get(k, 0) - baseline.get(k, 0) for k in TOKEN_LIMITS)
+            sum(max(0, totals.get(k, 0) - baseline.get(k, 0)) for k in TOKEN_LIMITS)
             if baseline else None
         )
         summary = Text()
@@ -229,39 +229,49 @@ def build_openai_panel(status: dict, stats: dict) -> Panel:
 
 # ── Antigravity ──────────────────────────────────────────────────────────────
 
-_antigravity_version_cache: str | None = None
+_antigravity_info_cache: dict | None = None
+_antigravity_last_check: float = 0.0
+ANTIGRAVITY_RECHECK_INTERVAL = 60  # 秒。永久キャッシュにせず定期的に再確認する
 
 
 def fetch_antigravity_info() -> dict:
-    """agy CLI を使って Antigravity の状態とバージョンを取得する。"""
-    global _antigravity_version_cache
+    """agy CLI を使って Antigravity の状態とバージョンを取得する。
 
-    info = {
-        "active":  False,
-        "version": _antigravity_version_cache,
-        "status":  "準備完了",
-        "error":   None,
-    }
+    一定間隔（ANTIGRAVITY_RECHECK_INTERVAL）ごとに再チェックし、
+    成功・失敗いずれの状態（active/version/status/error 全体）も
+    次回再確認まで保持する。
+    """
+    global _antigravity_info_cache, _antigravity_last_check
 
-    if _antigravity_version_cache is None:
+    now = time.time()
+    needs_check = (
+        _antigravity_info_cache is None
+        or (now - _antigravity_last_check) >= ANTIGRAVITY_RECHECK_INTERVAL
+    )
+
+    if needs_check:
+        _antigravity_last_check = now
+        info = {
+            "active":  False,
+            "version": None,
+            "status":  "準備完了",
+            "error":   None,
+        }
         try:
             result = subprocess.run(
                 ["agy", "--version"],
                 capture_output=True, text=True, timeout=5,
             )
             if result.returncode == 0:
-                _antigravity_version_cache = result.stdout.strip()
-                info["version"] = _antigravity_version_cache
+                info["version"] = result.stdout.strip()
                 info["active"] = True
             else:
                 info["error"] = (result.stderr or result.stdout or "エラー").strip()
         except Exception as e:
             info["error"] = f"agy CLI 未検出: {e}"
-    else:
-        info["version"] = _antigravity_version_cache
-        info["active"] = True
+        _antigravity_info_cache = info
 
-    return info
+    return _antigravity_info_cache
 
 
 def build_antigravity_panel(info: dict) -> Panel:

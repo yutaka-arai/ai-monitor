@@ -81,12 +81,14 @@ def main():
     print(f"[sync] 開始  出力先: {OUTPUT_FILE}  更新間隔: {INTERVAL}秒")
     print(f"[sync] 読み込み元: {CLAUDE_DIR}")
     while True:
+        tmp_file = OUTPUT_FILE.with_suffix(".json.tmp")
         try:
             data    = scan_and_aggregate()
             results = data["data"][0]["results"]
 
-            with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+            with open(tmp_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_file, OUTPUT_FILE)
 
             total_input  = sum(r["uncached_input_tokens"] for r in results)
             total_output = sum(r["output_tokens"]          for r in results)
@@ -100,6 +102,12 @@ def main():
 
         except Exception as e:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] エラー: {e}")
+            # atomic write 失敗時の残骸を掃除する（cleanup 失敗は元の例外を隠さないよう握りつぶす）
+            if tmp_file.exists():
+                try:
+                    tmp_file.unlink()
+                except OSError:
+                    pass
 
         time.sleep(INTERVAL)
 
