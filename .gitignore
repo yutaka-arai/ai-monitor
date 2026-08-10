@@ -5,3 +5,7 @@ claude_usage_log.json
 monitor.py.bak
 sync.log
 nohup.out
+# AI review / work logs
+claude_*.log
+claude_*.txt
+grok_*_review.md
