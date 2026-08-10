@@ -13,3 +13,4 @@ grok_*_review.md
 # Grok review / work logs
 grok_*.log
 grok_*.txt
+sync_claude_usage.log
