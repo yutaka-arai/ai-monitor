@@ -14,3 +14,7 @@ grok_*_review.md
 grok_*.log
 grok_*.txt
 sync_claude_usage.log
+
+# Local-specific config with hardcoded absolute paths (do not commit)
+.claude/settings.local.json
+.github/hooks/agmsg.json
