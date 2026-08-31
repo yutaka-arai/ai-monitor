@@ -4,7 +4,7 @@ import os
 import re
 import subprocess
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import requests
 from dotenv import load_dotenv
@@ -23,6 +23,11 @@ LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "claude_usag
 
 REFRESH_INTERVAL = 5  # seconds
 BAR_WIDTH        = 20  # 横並び用コンパクトバー幅
+
+# sync（sync_claude_usage.py）の更新が途絶えたと見なす閾値。
+# sync は毎周期 ~218MB を rglob するため 1 周期は INTERVAL(5s)+scan(実測~1s)≒6s。
+# 正常稼働中の generated_at 間隔ゆらぎで誤検知しないよう、その約3倍かつ最低 60s を採用する。
+STALE_THRESHOLD_SECONDS = 60
 
 # Claude: 月間トークン基準上限
 TOKEN_LIMITS = {
@@ -92,6 +97,27 @@ def load_usage_from_log() -> tuple[dict | None, str | None, str | None]:
         return None, None, f"読み込みエラー: {e}"
 
 
+def compute_data_age(data: dict) -> float | None:
+    """ログデータの経過秒数を返す。
+
+    sync が書き込む generated_at（ISO8601）を優先し、無ければ（旧フォーマット等）
+    ファイルの mtime にフォールバックする。判定不能なら None。
+    """
+    gen = data.get("generated_at")
+    if gen:
+        try:
+            dt = datetime.fromisoformat(gen.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return (datetime.now(timezone.utc) - dt).total_seconds()
+        except ValueError:
+            pass
+    try:
+        return time.time() - os.path.getmtime(LOG_FILE)
+    except OSError:
+        return None
+
+
 def aggregate_usage(data: dict) -> tuple[dict, list]:
     totals = {k: 0 for k in TOKEN_LIMITS}
     flat   = []
@@ -121,13 +147,25 @@ def _session_diff(totals: dict, baseline: dict | None, key: str) -> str:
     return f"  [dim cyan]↑ セッション: +{diff:,}[/dim cyan]"
 
 
-def build_claude_panel(totals: dict, error_msg: str | None, baseline: dict | None, log_time: str | None = None) -> Panel:
+def build_claude_panel(totals: dict, error_msg: str | None, baseline: dict | None,
+                       log_time: str | None = None,
+                       is_stale: bool = False, data_age: float | None = None) -> Panel:
     g = Table.grid(padding=(0, 1))
     g.add_column(ratio=1)
 
     if error_msg:
         g.add_row(Text.from_markup(f"[red]{error_msg}[/red]"))
     else:
+        # sync 停止・古いデータ検知（baseline 有無に依存せず毎ループ評価）
+        if is_stale:
+            age_str = f"{int(data_age)}s前" if data_age is not None else "不明"
+            g.add_row(Text.from_markup(
+                f"[bold red]⚠ Claude usage sync stale[/bold red]"
+            ))
+            g.add_row(Text.from_markup(
+                f"[red]同期停止の可能性（最終更新 {age_str}）[/red]"
+            ))
+            g.add_row(Text(""))
         for label, key, limit, color in [
             ("Input",      "input_tokens",                100_000, "green"),
             ("Output",     "output_tokens",                50_000, "yellow"),
@@ -452,10 +490,19 @@ def main():
 
             # Claude: ログファイルを毎ループ読み込み（ローカル・高速）
             claude_data, claude_log_time, claude_error = load_usage_from_log()
+            claude_is_stale = False
+            claude_data_age = None
             if claude_data is not None:
                 totals, _ = aggregate_usage(claude_data)
-                # 起動後の初回成功取得をベースラインとして保存
-                if claude_baseline is None:
+                claude_data_age = compute_data_age(claude_data)
+                claude_is_stale = (
+                    claude_data_age is not None
+                    and claude_data_age > STALE_THRESHOLD_SECONDS
+                )
+                # ベースラインは「新鮮な（stale でない）」データからのみ採用する。
+                # sync 停止中の古い JSON をベースラインにすると、sync 再開後に
+                # セッション差分へ過去分が丸ごと混入するため（例: 863,785-192,742）。
+                if claude_baseline is None and not claude_is_stale:
                     claude_baseline = dict(totals)
             else:
                 totals = {k: 0 for k in TOKEN_LIMITS}
@@ -477,7 +524,8 @@ def main():
 
             def _make_display(countdown: int) -> Layout:
                 return build_display(
-                    build_claude_panel(totals, claude_error, claude_baseline, claude_log_time),
+                    build_claude_panel(totals, claude_error, claude_baseline, claude_log_time,
+                                       claude_is_stale, claude_data_age),
                     build_openai_panel(openai_status, dict(openai_session_stats)),
                     build_antigravity_panel(antigravity_info),
                     build_copilot_panel(copilot_info),

@@ -86,6 +86,9 @@ def main():
             data    = scan_and_aggregate()
             results = data["data"][0]["results"]
 
+            # 更新時刻を記録（monitor 側の stale 検知・ベースライン判定に使う）
+            data["generated_at"] = datetime.now(timezone.utc).isoformat()
+
             with open(tmp_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             os.replace(tmp_file, OUTPUT_FILE)
